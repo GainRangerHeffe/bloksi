@@ -1,0 +1,63 @@
+{
+  "name": "Bloksi - MemeJournal Pro",
+  "description": "Multi-Chain Crypto Trading Journal - Track your meme coin trades across Ethereum, BSC, Base, and PulseChain",
+  "repository": "https://github.com/GainRangerHeffe/bloksi",
+  "keywords": [
+    "crypto",
+    "trading",
+    "journal",
+    "blockchain",
+    "ethereum",
+    "bsc",
+    "base",
+    "pulsechain",
+    "defi"
+  ],
+  "stack": "heroku-22",
+  "env": {
+    "NODE_ENV": {
+      "description": "Node environment",
+      "value": "production"
+    },
+    "MONGODB_URI": {
+      "description": "MongoDB Atlas connection string (format: mongodb+srv://username:password@cluster.mongodb.net/databasename)",
+      "required": true
+    },
+    "FRONTEND_URL": {
+      "description": "Your Hostinger frontend domain for CORS (e.g., https://yourdomain.com)",
+      "required": true
+    },
+    "ETHEREUM_RPC": {
+      "description": "Custom Ethereum RPC endpoint (optional)",
+      "value": "https://eth.llamarpc.com",
+      "required": false
+    },
+    "BSC_RPC": {
+      "description": "Custom BSC RPC endpoint (optional)",
+      "value": "https://bsc-dataseed.binance.org",
+      "required": false
+    },
+    "BASE_RPC": {
+      "description": "Custom Base RPC endpoint (optional)",
+      "value": "https://mainnet.base.org",
+      "required": false
+    },
+    "PULSECHAIN_RPC": {
+      "description": "Custom PulseChain RPC endpoint (optional)",
+      "value": "https://rpc.pulsechain.com",
+      "required": false
+    }
+  },
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  },
+  "addons": [],
+  "buildpacks": [
+    {
+      "url": "heroku/nodejs"
+    }
+  ]
+}
