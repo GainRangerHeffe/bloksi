@@ -6,7 +6,7 @@ Track your trades across Ethereum, BSC, Base, and PulseChain with real-time P&L 
 
 ## 🚀 One-Click Deploy Backend to Heroku
 
-[![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy)
+[![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/GainRangerHeffe/bloksi)
 
 ## 📋 Environment Variables Required:
 
