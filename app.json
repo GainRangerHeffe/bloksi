@@ -20,11 +20,11 @@
       "value": "production"
     },
     "MONGODB_URI": {
-      "description": "MongoDB Atlas connection string (format: mongodb+srv://username:password@cluster.mongodb.net/databasename)",
+      "description": "MongoDB Atlas connection string (format: mongodb+srv://greenrangerdev:bFQoe12OCRmRrcMr@[FULL-CLUSTER-NAME]/Portfolio?retryWrites=true&w=majority)",
       "required": true
     },
     "FRONTEND_URL": {
-      "description": "Your Hostinger frontend domain for CORS (e.g., https://yourdomain.com)",
+      "description": "Your Hostinger frontend domain for CORS (e.g., https://bloksi.xyz)",
       "required": true
     },
     "ETHEREUM_RPC": {
