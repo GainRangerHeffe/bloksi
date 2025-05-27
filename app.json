@@ -20,7 +20,7 @@
       "value": "production"
     },
     "MONGODB_URI": {
-      "description": "MongoDB Atlas connection string (format: mongodb+srv://greenrangerdev:bFQoe12OCRmRrcMr@[FULL-CLUSTER-NAME]/Portfolio?retryWrites=true&w=majority)",
+      "description": "MongoDB Atlas connection string (format: mongodb+srv://greenrangerdev:bFQoe12OCRmRrcMr@portfolio.wbbap1k.mongodb.net/",
       "required": true
     },
     "FRONTEND_URL": {
