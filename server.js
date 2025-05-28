@@ -13,6 +13,9 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ✅ FIX: Trust Heroku's proxy for rate limiting
+app.set('trust proxy', true);
+
 // Security & Middleware
 app.use(helmet({
     contentSecurityPolicy: false, // Allow for frontend flexibility
@@ -26,7 +29,7 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
-// Rate limiting
+// ✅ FIX: Rate limiting configured for Heroku
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 100, // Limit each IP to 100 requests per windowMs
@@ -44,21 +47,21 @@ const SUPPORTED_CHAINS = {
     ethereum: {
         chainId: 1,
         name: 'Ethereum',
-        rpc: process.env.ETHEREUM_RPC || 'https://eth.llamarpc.com',
+        rpc: process.env.ETHEREUM_RPC || 'https://rpc.ankr.com/eth',
         currency: 'ETH',
         blockTime: 12000
     },
     bsc: {
         chainId: 56,
         name: 'BSC',
-        rpc: process.env.BSC_RPC || 'https://bsc-dataseed.binance.org',
+        rpc: process.env.BSC_RPC || 'https://bsc-dataseed.bnbchain.org',
         currency: 'BNB',
         blockTime: 3000
     },
     base: {
         chainId: 8453,
         name: 'Base',
-        rpc: process.env.BASE_RPC || 'https://mainnet.base.org',
+        rpc: process.env.BASE_RPC || 'https://rpc.ankr.com/base',
         currency: 'ETH',
         blockTime: 2000
     },
@@ -169,7 +172,7 @@ const Transaction = mongoose.model('Transaction', transactionSchema);
 const LiquidityPosition = mongoose.model('LiquidityPosition', liquidityPositionSchema);
 const LPTransaction = mongoose.model('LPTransaction', lpTransactionSchema);
 
-// Blockchain Service
+// ✅ IMPROVED: Blockchain Service with better error handling and filtering
 class BlockchainService {
     constructor() {
         this.providers = {};
@@ -179,7 +182,12 @@ class BlockchainService {
 
     initializeProviders() {
         Object.entries(SUPPORTED_CHAINS).forEach(([key, config]) => {
-            this.providers[key] = new ethers.JsonRpcProvider(config.rpc);
+            try {
+                this.providers[key] = new ethers.JsonRpcProvider(config.rpc);
+                console.log(`✅ Initialized ${key} provider: ${config.rpc}`);
+            } catch (error) {
+                console.error(`❌ Failed to initialize ${key} provider:`, error.message);
+            }
         });
     }
 
@@ -189,11 +197,11 @@ class BlockchainService {
 
         for (const chainKey of chainsToSync) {
             try {
-                console.log(`Syncing ${chainKey} for ${userAddress}`);
+                console.log(`🔄 Syncing ${chainKey} for ${userAddress}`);
                 const chainResult = await this.syncChain(userAddress, chainKey);
                 results[chainKey] = chainResult;
             } catch (error) {
-                console.error(`Failed to sync ${chainKey}:`, error);
+                console.error(`❌ Failed to sync ${chainKey}:`, error.message);
                 results[chainKey] = { success: false, error: error.message };
             }
         }
@@ -219,7 +227,7 @@ class BlockchainService {
         const lastSyncedBlock = user.lastSyncedBlocks[chainKey] || Math.max(0, currentBlock - 10000);
         const fromBlock = lastSyncedBlock + 1;
 
-        console.log(`Scanning ${chainKey} blocks ${fromBlock} to ${currentBlock}`);
+        console.log(`📊 Scanning ${chainKey} blocks ${fromBlock} to ${currentBlock}`);
 
         // Get transfer events
         const transfers = await this.getTransferEvents(provider, userAddress, fromBlock, currentBlock, chainKey);
@@ -228,10 +236,10 @@ class BlockchainService {
         let processedCount = 0;
         for (const transfer of transfers) {
             try {
-                await this.processTransfer(transfer, userAddress, chainKey);
-                processedCount++;
+                const processed = await this.processTransfer(transfer, userAddress, chainKey);
+                if (processed) processedCount++;
             } catch (error) {
-                console.warn(`Failed to process transfer ${transfer.hash}:`, error.message);
+                console.warn(`⚠️ Failed to process transfer ${transfer.transactionHash}:`, error.message);
             }
         }
 
@@ -246,6 +254,8 @@ class BlockchainService {
             }
         );
 
+        console.log(`✅ ${chainKey}: ${processedCount}/${transfers.length} transfers processed`);
+
         return {
             success: true,
             blocksScanned: currentBlock - fromBlock + 1,
@@ -256,7 +266,7 @@ class BlockchainService {
 
     async getTransferEvents(provider, userAddress, fromBlock, toBlock, chainKey) {
         const transfers = [];
-        const batchSize = 5000;
+        const batchSize = 2000; // Reduced batch size for better reliability
         const paddedAddress = ethers.zeroPadValue(userAddress.toLowerCase(), 32);
 
         // Scan in batches to avoid RPC limits
@@ -281,16 +291,16 @@ class BlockchainService {
                 // Combine and deduplicate
                 const allLogs = [...outgoingLogs, ...incomingLogs];
                 const uniqueLogs = allLogs.filter((log, index, self) => 
-                    index === self.findIndex(l => l.transactionHash === log.transactionHash)
+                    index === self.findIndex(l => l.transactionHash === log.transactionHash && l.logIndex === log.logIndex)
                 );
 
                 transfers.push(...uniqueLogs);
 
                 // Add delay to respect rate limits
-                await new Promise(resolve => setTimeout(resolve, 100));
+                await new Promise(resolve => setTimeout(resolve, 200));
 
             } catch (error) {
-                console.warn(`Failed to get logs for blocks ${block}-${endBlock}:`, error.message);
+                console.warn(`⚠️ Failed to get logs for blocks ${block}-${endBlock}:`, error.message);
                 continue;
             }
         }
@@ -298,121 +308,143 @@ class BlockchainService {
         return transfers;
     }
 
+    // ✅ IMPROVED: Better transaction filtering and processing
     async processTransfer(log, userAddress, chainKey) {
         const provider = this.providers[chainKey];
         
-        // Get transaction details
-        const [tx, receipt] = await Promise.all([
-            provider.getTransaction(log.transactionHash),
-            provider.getTransactionReceipt(log.transactionHash)
-        ]);
+        try {
+            // Get transaction details
+            const [tx, receipt] = await Promise.all([
+                provider.getTransaction(log.transactionHash),
+                provider.getTransactionReceipt(log.transactionHash)
+            ]);
 
-        if (!tx || !receipt) return;
+            if (!tx || !receipt) return false;
 
-        // Decode transfer data
-        const fromAddress = '0x' + log.topics[1].slice(26).toLowerCase();
-        const toAddress = '0x' + log.topics[2].slice(26).toLowerCase();
-        const amount = ethers.getBigInt(log.data);
+            // Decode transfer data
+            const fromAddress = '0x' + log.topics[1].slice(26).toLowerCase();
+            const toAddress = '0x' + log.topics[2].slice(26).toLowerCase();
+            const amount = ethers.getBigInt(log.data);
 
-        // Determine transaction type
-        const isOutgoing = fromAddress === userAddress.toLowerCase();
-        const isIncoming = toAddress === userAddress.toLowerCase();
-        
-        if (!isOutgoing && !isIncoming) return;
+            // Determine transaction type
+            const isOutgoing = fromAddress === userAddress.toLowerCase();
+            const isIncoming = toAddress === userAddress.toLowerCase();
+            
+            if (!isOutgoing && !isIncoming) return false;
 
-        // Get token info
-        const tokenInfo = await this.getTokenInfo(provider, log.address);
-        const tokenAmount = Number(amount) / Math.pow(10, tokenInfo.decimals);
-        
-        // ✅ FILTER 1: Skip very small amounts (likely dust/spam)
-        if (tokenAmount < 0.000001) {
-            console.log(`Skipping dust transfer: ${tokenAmount} ${tokenInfo.symbol}`);
-            return;
-        }
-        
-        // ✅ FILTER 2: Skip zero-value incoming transfers (likely airdrops/rewards)
-        const ethValue = Number(tx.value || 0);
-        if (ethValue === 0 && isIncoming) {
-            console.log(`Skipping zero-value incoming transfer: ${tokenInfo.symbol} (likely airdrop)`);
-            return;
-        }
+            // Get token info
+            const tokenInfo = await this.getTokenInfo(provider, log.address);
+            const tokenAmount = Number(amount) / Math.pow(10, tokenInfo.decimals);
+            
+            // ✅ SMART FILTERING: Skip obvious spam/dust
+            if (tokenAmount < 0.001) {
+                console.log(`🗑️ Skipping dust: ${tokenAmount} ${tokenInfo.symbol}`);
+                return false;
+            }
+            
+            // ✅ SMART FILTERING: Skip small zero-value airdrops but allow large ones
+            const ethValue = Number(tx.value || 0);
+            if (ethValue === 0 && isIncoming && tokenAmount < 100) {
+                console.log(`🎁 Skipping small airdrop: ${tokenAmount} ${tokenInfo.symbol}`);
+                return false;
+            }
 
-        // Check if transaction already exists
-        const existingTx = await Transaction.findOne({ hash: log.transactionHash });
-        if (existingTx) return;
+            // Check if transaction already exists
+            const existingTx = await Transaction.findOne({ hash: log.transactionHash });
+            if (existingTx) return false;
 
-        // Create transaction
-        const transaction = new Transaction({
-            userAddress: userAddress.toLowerCase(),
-            chain: chainKey,
-            hash: log.transactionHash,
-            blockNumber: tx.blockNumber,
-            timestamp: new Date((await provider.getBlock(tx.blockNumber)).timestamp * 1000),
-            from: fromAddress,
-            to: toAddress,
-            tokenAddress: log.address.toLowerCase(),
-            tokenSymbol: tokenInfo.symbol,
-            type: isOutgoing ? 'sell' : 'buy',
-            amount: tokenAmount,
-            priceUSD: await this.estimateTokenPrice(tokenAmount, tx.value, tokenInfo.decimals),
-            gasUsed: Number(receipt.gasUsed || 0), // Convert BigInt to Number
-            gasPrice: Number(tx.gasPrice || 0)     // Convert BigInt to Number
-        });
+            // Create transaction
+            const transaction = new Transaction({
+                userAddress: userAddress.toLowerCase(),
+                chain: chainKey,
+                hash: log.transactionHash,
+                blockNumber: tx.blockNumber,
+                timestamp: new Date((await provider.getBlock(tx.blockNumber)).timestamp * 1000),
+                from: fromAddress,
+                to: toAddress,
+                tokenAddress: log.address.toLowerCase(),
+                tokenSymbol: tokenInfo.symbol,
+                type: isOutgoing ? 'sell' : 'buy',
+                amount: tokenAmount,
+                priceUSD: await this.estimateTokenPrice(tokenAmount, tx.value, tokenInfo.decimals),
+                gasUsed: Number(receipt.gasUsed || 0), // ✅ FIX: Convert BigInt to Number
+                gasPrice: Number(tx.gasPrice || 0)     // ✅ FIX: Convert BigInt to Number
+            });
 
-        transaction.valueUSD = transaction.amount * transaction.priceUSD;
-        
-        // ✅ FILTER 3: Only save transactions with reasonable value
-        if (transaction.valueUSD > 0.01 || ethValue > 0) {
-            await transaction.save();
-            await this.updateTokenData(userAddress, chainKey, log.address, tokenInfo, transaction);
-            console.log(`✅ Processed ${transaction.type}: ${tokenAmount} ${tokenInfo.symbol} for $${transaction.valueUSD.toFixed(4)}`);
-        } else {
-            console.log(`❌ Skipped low-value transfer: ${tokenAmount} ${tokenInfo.symbol}`);
+            transaction.valueUSD = transaction.amount * transaction.priceUSD;
+            
+            // ✅ FLEXIBLE SAVING: Save meaningful transactions
+            const shouldSave = transaction.valueUSD > 0.001 || ethValue > 0 || tokenAmount > 1000;
+            
+            if (shouldSave) {
+                await transaction.save();
+                await this.updateTokenData(userAddress, chainKey, log.address, tokenInfo, transaction);
+                console.log(`💰 Saved ${transaction.type}: ${tokenAmount.toFixed(4)} ${tokenInfo.symbol} ($${transaction.valueUSD.toFixed(4)})`);
+                return true;
+            } else {
+                console.log(`⏭️ Skipped: ${tokenAmount.toFixed(4)} ${tokenInfo.symbol} ($${transaction.valueUSD.toFixed(4)})`);
+                return false;
+            }
+            
+        } catch (error) {
+            console.error(`❌ Process transfer error:`, error.message);
+            return false;
         }
     }
+
     async getTokenInfo(provider, tokenAddress) {
         try {
-            // Simple ERC20 calls
-            const symbolCall = provider.call({ to: tokenAddress, data: '0x95d89b41' }); // symbol()
-            const nameCall = provider.call({ to: tokenAddress, data: '0x06fdde03' }); // name()
-            const decimalsCall = provider.call({ to: tokenAddress, data: '0x313ce567' }); // decimals()
-
+            // Simple ERC20 calls with better error handling
             const [symbolResult, nameResult, decimalsResult] = await Promise.allSettled([
-                symbolCall, nameCall, decimalsCall
+                provider.call({ to: tokenAddress, data: '0x95d89b41' }), // symbol()
+                provider.call({ to: tokenAddress, data: '0x06fdde03' }), // name()
+                provider.call({ to: tokenAddress, data: '0x313ce567' })  // decimals()
             ]);
 
             let symbol = 'UNKNOWN';
             let name = 'Unknown Token';
             let decimals = 18;
 
-            try {
-                if (symbolResult.status === 'fulfilled' && symbolResult.value !== '0x') {
-                    symbol = ethers.toUtf8String(symbolResult.value).replace(/\0/g, '') || 'UNKNOWN';
+            // Decode symbol
+            if (symbolResult.status === 'fulfilled' && symbolResult.value && symbolResult.value !== '0x') {
+                try {
+                    symbol = ethers.toUtf8String(symbolResult.value).replace(/\0/g, '').trim() || 'UNKNOWN';
+                } catch (e) {
+                    // Might be bytes32 format, try different approach
+                    try {
+                        symbol = ethers.parseBytes32String(symbolResult.value) || 'UNKNOWN';
+                    } catch (e2) {
+                        symbol = 'UNKNOWN';
+                    }
                 }
-            } catch (e) {
-                console.warn('Failed to decode symbol');
             }
 
-            try {
-                if (nameResult.status === 'fulfilled' && nameResult.value !== '0x') {
-                    name = ethers.toUtf8String(nameResult.value).replace(/\0/g, '') || 'Unknown Token';
+            // Decode name
+            if (nameResult.status === 'fulfilled' && nameResult.value && nameResult.value !== '0x') {
+                try {
+                    name = ethers.toUtf8String(nameResult.value).replace(/\0/g, '').trim() || 'Unknown Token';
+                } catch (e) {
+                    try {
+                        name = ethers.parseBytes32String(nameResult.value) || 'Unknown Token';
+                    } catch (e2) {
+                        name = 'Unknown Token';
+                    }
                 }
-            } catch (e) {
-                console.warn('Failed to decode name');
             }
 
-            try {
-                if (decimalsResult.status === 'fulfilled' && decimalsResult.value !== '0x') {
+            // Decode decimals
+            if (decimalsResult.status === 'fulfilled' && decimalsResult.value && decimalsResult.value !== '0x') {
+                try {
                     decimals = parseInt(decimalsResult.value, 16) || 18;
+                } catch (e) {
+                    decimals = 18;
                 }
-            } catch (e) {
-                console.warn('Failed to decode decimals');
             }
 
             return { symbol, name, decimals };
 
         } catch (error) {
-            console.warn('Error getting token info:', error);
+            console.warn(`⚠️ Token info error for ${tokenAddress}:`, error.message);
             return { symbol: 'UNKNOWN', name: 'Unknown Token', decimals: 18 };
         }
     }
@@ -432,100 +464,117 @@ class BlockchainService {
     }
 
     async updateTokenData(userAddress, chainKey, tokenAddress, tokenInfo, transaction) {
-        const token = await Token.findOneAndUpdate(
-            { 
-                userAddress: userAddress.toLowerCase(), 
-                chain: chainKey, 
-                contractAddress: tokenAddress.toLowerCase() 
-            },
-            {
-                $setOnInsert: {
-                    userAddress: userAddress.toLowerCase(),
-                    chain: chainKey,
-                    contractAddress: tokenAddress.toLowerCase(),
-                    symbol: tokenInfo.symbol,
-                    name: tokenInfo.name,
-                    decimals: tokenInfo.decimals
-                }
-            },
-            { upsert: true, new: true }
-        );
+        try {
+            const token = await Token.findOneAndUpdate(
+                { 
+                    userAddress: userAddress.toLowerCase(), 
+                    chain: chainKey, 
+                    contractAddress: tokenAddress.toLowerCase() 
+                },
+                {
+                    $setOnInsert: {
+                        userAddress: userAddress.toLowerCase(),
+                        chain: chainKey,
+                        contractAddress: tokenAddress.toLowerCase(),
+                        symbol: tokenInfo.symbol,
+                        name: tokenInfo.name,
+                        decimals: tokenInfo.decimals
+                    }
+                },
+                { upsert: true, new: true }
+            );
 
-        // Add transaction to token
-        await Token.updateOne(
-            { _id: token._id },
-            { $addToSet: { trades: transaction._id } }
-        );
+            // Add transaction to token
+            await Token.updateOne(
+                { _id: token._id },
+                { $addToSet: { trades: transaction._id } }
+            );
 
-        // Update token calculations
-        await this.recalculateTokenMetrics(token._id);
+            // Update token calculations
+            await this.recalculateTokenMetrics(token._id);
+        } catch (error) {
+            console.error('Update token data error:', error.message);
+        }
     }
 
     async recalculateTokenMetrics(tokenId) {
-        const token = await Token.findById(tokenId).populate('trades');
-        if (!token) return;
+        try {
+            const token = await Token.findById(tokenId).populate('trades');
+            if (!token) return;
 
-        let totalBought = 0;
-        let totalSold = 0;
-        let totalBoughtValue = 0;
-        let totalSoldValue = 0;
-        let realizedPnL = 0;
+            let totalBought = 0;
+            let totalSold = 0;
+            let totalBoughtValue = 0;
+            let totalSoldValue = 0;
+            let realizedPnL = 0;
 
-        const buyTrades = token.trades.filter(t => t.type === 'buy');
-        const sellTrades = token.trades.filter(t => t.type === 'sell');
+            const buyTrades = token.trades.filter(t => t.type === 'buy');
+            const sellTrades = token.trades.filter(t => t.type === 'sell');
 
-        // Calculate buy metrics
-        buyTrades.forEach(trade => {
-            totalBought += trade.amount;
-            totalBoughtValue += trade.valueUSD;
-        });
+            // Calculate buy metrics
+            buyTrades.forEach(trade => {
+                totalBought += trade.amount;
+                totalBoughtValue += trade.valueUSD;
+            });
 
-        // Calculate sell metrics
-        sellTrades.forEach(trade => {
-            totalSold += trade.amount;
-            totalSoldValue += trade.valueUSD;
-        });
+            // Calculate sell metrics
+            sellTrades.forEach(trade => {
+                totalSold += trade.amount;
+                totalSoldValue += trade.valueUSD;
+            });
 
-        const avgBuyPrice = totalBought > 0 ? totalBoughtValue / totalBought : 0;
-        const avgSellPrice = totalSold > 0 ? totalSoldValue / totalSold : 0;
+            const avgBuyPrice = totalBought > 0 ? totalBoughtValue / totalBought : 0;
+            const avgSellPrice = totalSold > 0 ? totalSoldValue / totalSold : 0;
 
-        // Calculate realized PnL (simplified)
-        if (totalSold > 0 && avgBuyPrice > 0) {
-            realizedPnL = (avgSellPrice - avgBuyPrice) * totalSold;
-        }
-
-        const currentBalance = totalBought - totalSold;
-        const unrealizedPnL = currentBalance > 0 ? (avgBuyPrice * currentBalance * 0.1) : 0; // Mock unrealized PnL
-
-        await Token.updateOne(
-            { _id: tokenId },
-            {
-                $set: {
-                    balance: currentBalance,
-                    totalBought,
-                    totalSold,
-                    avgBuyPrice,
-                    avgSellPrice,
-                    realizedPnL,
-                    unrealizedPnL,
-                    totalPnL: realizedPnL + unrealizedPnL,
-                    valueUSD: currentBalance * avgBuyPrice,
-                    updatedAt: new Date()
-                }
+            // Calculate realized PnL (simplified)
+            if (totalSold > 0 && avgBuyPrice > 0) {
+                realizedPnL = (avgSellPrice - avgBuyPrice) * totalSold;
             }
-        );
+
+            const currentBalance = totalBought - totalSold;
+            const unrealizedPnL = currentBalance > 0 ? (avgBuyPrice * currentBalance * 0.1) : 0; // Mock unrealized PnL
+
+            await Token.updateOne(
+                { _id: tokenId },
+                {
+                    $set: {
+                        balance: Math.max(0, currentBalance), // Ensure non-negative
+                        totalBought,
+                        totalSold,
+                        avgBuyPrice,
+                        avgSellPrice,
+                        realizedPnL,
+                        unrealizedPnL,
+                        totalPnL: realizedPnL + unrealizedPnL,
+                        valueUSD: Math.max(0, currentBalance * avgBuyPrice),
+                        updatedAt: new Date()
+                    }
+                }
+            );
+        } catch (error) {
+            console.error('Recalculate metrics error:', error.message);
+        }
     }
 
     async updateUserBalance(userAddress) {
-        const tokens = await Token.find({ userAddress: userAddress.toLowerCase() });
-        const totalBalance = tokens.reduce((sum, token) => sum + (token.valueUSD || 0), 0);
+        try {
+            const tokens = await Token.find({ 
+                userAddress: userAddress.toLowerCase(),
+                balance: { $gt: 0 } // Only count tokens with positive balance
+            });
+            
+            const totalBalance = tokens.reduce((sum, token) => sum + (token.valueUSD || 0), 0);
 
-        await User.updateOne(
-            { address: userAddress.toLowerCase() },
-            { $set: { totalBalance, updatedAt: new Date() } }
-        );
+            await User.updateOne(
+                { address: userAddress.toLowerCase() },
+                { $set: { totalBalance, updatedAt: new Date() } }
+            );
 
-        return totalBalance;
+            return totalBalance;
+        } catch (error) {
+            console.error('Update user balance error:', error.message);
+            return 0;
+        }
     }
 }
 
@@ -534,7 +583,12 @@ const blockchainService = new BlockchainService();
 
 // API Routes
 app.get('/api/health', (req, res) => {
-    res.json({ success: true, message: 'MemeJournal Pro API is running!' });
+    res.json({ 
+        success: true, 
+        message: 'MemeJournal Pro API is running!',
+        timestamp: new Date().toISOString(),
+        chains: Object.keys(SUPPORTED_CHAINS)
+    });
 });
 
 // Get user data
@@ -660,7 +714,7 @@ app.get('/api/analytics/:address', async (req, res) => {
 
         const [user, tokens, transactions, lpPositions] = await Promise.all([
             User.findOne({ address: address.toLowerCase() }),
-            Token.find({ userAddress: address.toLowerCase() }),
+            Token.find({ userAddress: address.toLowerCase(), balance: { $gt: 0 } }),
             Transaction.find({ userAddress: address.toLowerCase() }),
             LiquidityPosition.find({ userAddress: address.toLowerCase() })
         ]);
@@ -670,7 +724,7 @@ app.get('/api/analytics/:address', async (req, res) => {
             totalRealizedPnL: tokens.reduce((sum, t) => sum + (t.realizedPnL || 0), 0),
             totalUnrealizedPnL: tokens.reduce((sum, t) => sum + (t.unrealizedPnL || 0), 0),
             totalTrades: transactions.length,
-            activePositions: tokens.filter(t => t.balance > 0).length + lpPositions.filter(lp => lp.isActive).length,
+            activePositions: tokens.length + lpPositions.filter(lp => lp.isActive).length,
             winRate: transactions.length > 0 ? 
                 (transactions.filter(t => (t.pnl || 0) > 0).length / transactions.length * 100) : 0
         };
@@ -700,7 +754,7 @@ app.post('/api/sync', async (req, res) => {
             }
         }
 
-        console.log(`Starting sync for ${address} on chains: ${chainsToSync.join(', ')}`);
+        console.log(`🚀 Starting sync for ${address} on chains: ${chainsToSync.join(', ')}`);
 
         const results = await blockchainService.syncUserData(address.toLowerCase(), chainsToSync);
         const totalBalance = await blockchainService.updateUserBalance(address.toLowerCase());
@@ -740,10 +794,10 @@ mongoose.connect(process.env.MONGODB_URI, {
     process.exit(1);
 });
 
-// Graceful shutdown
+// ✅ FIX: Graceful shutdown without callback
 process.on('SIGTERM', () => {
     console.log('SIGTERM received, shutting down gracefully');
-    mongoose.connection.close(() => {
+    mongoose.connection.close().then(() => {
         console.log('MongoDB connection closed');
         process.exit(0);
     });
