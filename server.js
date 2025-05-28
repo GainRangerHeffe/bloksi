@@ -30,7 +30,12 @@ app.use(express.json({ limit: '10mb' }));
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 100, // Limit each IP to 100 requests per windowMs
-    message: { success: false, message: 'Too many requests, please try again later.' }
+    message: { success: false, message: 'Too many requests, please try again later.' },
+    trustProxy: true, // Trust Heroku's proxy
+    skip: (req) => {
+        // Skip rate limiting for health checks
+        return req.path === '/api/health';
+    }
 });
 app.use('/api/', limiter);
 
