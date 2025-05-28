@@ -337,8 +337,8 @@ class BlockchainService {
             type: isOutgoing ? 'sell' : 'buy',
             amount: tokenAmount,
             priceUSD: await this.estimateTokenPrice(tokenAmount, tx.value, tokenInfo.decimals),
-            gasUsed: receipt.gasUsed,
-            gasPrice: tx.gasPrice || 0
+            gasUsed: Number(receipt.gasUsed || 0), // Convert BigInt to Number
+            gasPrice: Number(tx.gasPrice || 0)     // Convert BigInt to Number
         });
 
         transaction.valueUSD = transaction.amount * transaction.priceUSD;
