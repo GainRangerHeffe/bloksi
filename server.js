@@ -318,6 +318,19 @@ class BlockchainService {
         // Get token info
         const tokenInfo = await this.getTokenInfo(provider, log.address);
         const tokenAmount = Number(amount) / Math.pow(10, tokenInfo.decimals);
+        
+        // ✅ FILTER 1: Skip very small amounts (likely dust/spam)
+        if (tokenAmount < 0.000001) {
+            console.log(`Skipping dust transfer: ${tokenAmount} ${tokenInfo.symbol}`);
+            return;
+        }
+        
+        // ✅ FILTER 2: Skip zero-value incoming transfers (likely airdrops/rewards)
+        const ethValue = Number(tx.value || 0);
+        if (ethValue === 0 && isIncoming) {
+            console.log(`Skipping zero-value incoming transfer: ${tokenInfo.symbol} (likely airdrop)`);
+            return;
+        }
 
         // Check if transaction already exists
         const existingTx = await Transaction.findOne({ hash: log.transactionHash });
@@ -342,12 +355,16 @@ class BlockchainService {
         });
 
         transaction.valueUSD = transaction.amount * transaction.priceUSD;
-        await transaction.save();
-
-        // Update or create token
-        await this.updateTokenData(userAddress, chainKey, log.address, tokenInfo, transaction);
+        
+        // ✅ FILTER 3: Only save transactions with reasonable value
+        if (transaction.valueUSD > 0.01 || ethValue > 0) {
+            await transaction.save();
+            await this.updateTokenData(userAddress, chainKey, log.address, tokenInfo, transaction);
+            console.log(`✅ Processed ${transaction.type}: ${tokenAmount} ${tokenInfo.symbol} for $${transaction.valueUSD.toFixed(4)}`);
+        } else {
+            console.log(`❌ Skipped low-value transfer: ${tokenAmount} ${tokenInfo.symbol}`);
+        }
     }
-
     async getTokenInfo(provider, tokenAddress) {
         try {
             // Simple ERC20 calls
