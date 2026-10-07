@@ -20,7 +20,7 @@
       "value": "production"
     },
     "MONGODB_URI": {
-      "description": "MongoDB Atlas connection string (format: mongodb+srv://greenrangerdev:bFQoe12OCRmRrcMr@portfolio.wbbap1k.mongodb.net/",
+      "description": "MongoDB Atlas connection string (format: mongodb+srv://USER:PASSWORD@CLUSTER.mongodb.net/DATABASE)",
       "required": true
     },
     "FRONTEND_URL": {
