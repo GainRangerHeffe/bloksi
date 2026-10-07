@@ -29,6 +29,19 @@ Node.js 18, Express, MongoDB (Mongoose) and ethers v6, with Helmet, compression 
 | GET | `/api/analytics/:address` | Portfolio analytics |
 | POST | `/api/sync` | Sync a wallet's on-chain activity |
 
+## How it works
+
+`POST /api/sync` scans a wallet's ERC-20 `Transfer` logs on each chain (the last 10,000 blocks on a first sync, then from where it left off), stores each transfer, and recalculates per-token totals. Incoming transfers are recorded as buys and outgoing ones as sells.
+
+## Known limitations
+
+- **No price oracle.** The fields named `priceUSD` and `valueUSD` hold values in the chain's native coin (ETH, BNB or PLS), worked out from the native coin sent with the transaction. Sells and token-to-token swaps send no native coin, so they are valued at zero, and realized PnL is only a rough guide.
+- **Unrealized PnL is always 0.** It needs a current market price, which this service does not have.
+- **Win rate is always 0.** Per-transaction PnL is never calculated.
+- **Plain transfers count as trades.** Moving tokens between your own wallets shows up as a sell and a buy.
+- **Liquidity routes are read-only.** Nothing in the sync writes liquidity positions yet.
+- **Anyone can sync or read any address.** There is no authentication; the sync route is rate limited to 10 requests per 15 minutes per IP.
+
 ## Run locally
 
 ```bash
@@ -46,6 +59,18 @@ Create a `.env` file first:
 | `PORT` | no | Defaults to 3000 |
 
 Never commit the `.env` file or a real connection string.
+
+## Tests
+
+```bash
+npm test
+```
+
+The tests cover input validation on every route and the decoding of token names and symbols. They need no database or network.
+
+## Upgrading an existing database
+
+Transactions are now unique per wallet, chain, hash and log index, so that both sides of a swap are stored. A database created by an earlier version still has a unique index on `hash` alone; drop it once with `db.transactions.dropIndex("hash_1")`.
 
 ## Deploy
 

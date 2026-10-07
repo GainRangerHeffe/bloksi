@@ -1,5 +1,5 @@
-// MemeJournal Pro - Backend Server
-// Production-ready Node.js + Express + MongoDB
+// Bloksi - backend API
+// Node.js + Express + MongoDB
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -13,8 +13,9 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ FIX: Trust Heroku's proxy for rate limiting
-app.set('trust proxy', true);
+// Heroku puts one proxy in front of the app. Trusting exactly one hop lets the
+// rate limiter see the real client IP without letting clients spoof it.
+app.set('trust proxy', 1);
 
 // Security & Middleware
 app.use(helmet({
@@ -22,25 +23,35 @@ app.use(helmet({
 }));
 app.use(compression());
 app.use(cors({
-    origin: process.env.NODE_ENV === 'production' 
-        ? [process.env.FRONTEND_URL] 
+    origin: process.env.NODE_ENV === 'production'
+        ? [process.env.FRONTEND_URL].filter(Boolean)
         : ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:8080'],
     credentials: true
 }));
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '100kb' }));
 
-// ✅ FIX: Rate limiting configured for Heroku
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 100, // Limit each IP to 100 requests per windowMs
+    standardHeaders: true,
+    legacyHeaders: false,
     message: { success: false, message: 'Too many requests, please try again later.' },
-    trustProxy: true, // Trust Heroku's proxy
     skip: (req) => {
         // Skip rate limiting for health checks
         return req.path === '/api/health';
     }
 });
 app.use('/api/', limiter);
+
+// A sync scans thousands of blocks and makes several RPC calls per transfer,
+// so it gets a much tighter limit than the read endpoints.
+const syncLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many sync requests, please try again later.' }
+});
 
 // Blockchain Configuration
 const SUPPORTED_CHAINS = {
@@ -111,7 +122,8 @@ const tokenSchema = new mongoose.Schema({
 const transactionSchema = new mongoose.Schema({
     userAddress: { type: String, required: true, lowercase: true },
     chain: { type: String, required: true },
-    hash: { type: String, required: true, unique: true },
+    hash: { type: String, required: true },
+    logIndex: { type: Number, default: 0 },
     blockNumber: { type: Number, required: true },
     timestamp: { type: Date, required: true },
     from: { type: String, required: true, lowercase: true },
@@ -163,6 +175,8 @@ const lpTransactionSchema = new mongoose.Schema({
 // Compound indexes for performance
 tokenSchema.index({ userAddress: 1, chain: 1, contractAddress: 1 }, { unique: true });
 transactionSchema.index({ userAddress: 1, chain: 1, timestamp: -1 });
+// A swap emits one Transfer per token, so the hash alone is not unique.
+transactionSchema.index({ userAddress: 1, chain: 1, hash: 1, logIndex: 1 }, { unique: true });
 liquidityPositionSchema.index({ userAddress: 1, chain: 1, contractAddress: 1 });
 
 // Models
@@ -172,7 +186,36 @@ const Transaction = mongoose.model('Transaction', transactionSchema);
 const LiquidityPosition = mongoose.model('LiquidityPosition', liquidityPositionSchema);
 const LPTransaction = mongoose.model('LPTransaction', lpTransactionSchema);
 
-// ✅ IMPROVED: Blockchain Service with better error handling and filtering
+// ERC-20 symbol() and name() normally return an ABI-encoded string; a few old
+// tokens (MKR, for example) return bytes32 instead. Handle both.
+function decodeTokenString(data, fallback) {
+    if (!data || data === '0x') return fallback;
+    const clean = (value) => String(value).replace(/\0/g, '').trim();
+    try {
+        const [decoded] = ethers.AbiCoder.defaultAbiCoder().decode(['string'], data);
+        if (clean(decoded)) return clean(decoded);
+    } catch (error) {
+        // Not an ABI string; try bytes32 below.
+    }
+    try {
+        if (ethers.dataLength(data) === 32) {
+            // bytes32: the text is left-aligned and padded with zero bytes
+            const bytes = ethers.getBytes(data);
+            let end = bytes.length;
+            while (end > 0 && bytes[end - 1] === 0) end--;
+            const text = clean(ethers.toUtf8String(bytes.slice(0, end)));
+            if (text) return text;
+        }
+    } catch (error) {
+        // Fall through to the fallback.
+    }
+    return fallback;
+}
+
+function isObjectId(value) {
+    return mongoose.Types.ObjectId.isValid(value) && String(new mongoose.Types.ObjectId(value)) === String(value);
+}
+
 class BlockchainService {
     constructor() {
         this.providers = {};
@@ -230,8 +273,8 @@ class BlockchainService {
         console.log(`📊 Scanning ${chainKey} blocks ${fromBlock} to ${currentBlock}`);
 
         // Get transfer events
-        const transfers = await this.getTransferEvents(provider, userAddress, fromBlock, currentBlock, chainKey);
-        
+        const { transfers, lastScannedBlock } = await this.getTransferEvents(provider, userAddress, fromBlock, currentBlock, chainKey);
+
         // Process transfers into transactions and tokens
         let processedCount = 0;
         for (const transfer of transfers) {
@@ -246,9 +289,9 @@ class BlockchainService {
         // Update last synced block
         await User.updateOne(
             { address: userAddress },
-            { 
-                $set: { 
-                    [`lastSyncedBlocks.${chainKey}`]: currentBlock,
+            {
+                $set: {
+                    [`lastSyncedBlocks.${chainKey}`]: lastScannedBlock,
                     updatedAt: new Date()
                 }
             }
@@ -258,7 +301,8 @@ class BlockchainService {
 
         return {
             success: true,
-            blocksScanned: currentBlock - fromBlock + 1,
+            blocksScanned: Math.max(0, lastScannedBlock - fromBlock + 1),
+            complete: lastScannedBlock === currentBlock,
             transfersFound: transfers.length,
             transfersProcessed: processedCount
         };
@@ -266,13 +310,14 @@ class BlockchainService {
 
     async getTransferEvents(provider, userAddress, fromBlock, toBlock, chainKey) {
         const transfers = [];
+        let lastScannedBlock = fromBlock - 1;
         const batchSize = 2000; // Reduced batch size for better reliability
         const paddedAddress = ethers.zeroPadValue(userAddress.toLowerCase(), 32);
 
         // Scan in batches to avoid RPC limits
         for (let block = fromBlock; block <= toBlock; block += batchSize) {
             const endBlock = Math.min(block + batchSize - 1, toBlock);
-            
+
             try {
                 // Get outgoing transfers
                 const outgoingLogs = await provider.getLogs({
@@ -290,28 +335,29 @@ class BlockchainService {
 
                 // Combine and deduplicate
                 const allLogs = [...outgoingLogs, ...incomingLogs];
-                const uniqueLogs = allLogs.filter((log, index, self) => 
-                    index === self.findIndex(l => l.transactionHash === log.transactionHash && l.logIndex === log.logIndex)
+                const uniqueLogs = allLogs.filter((log, index, self) =>
+                    index === self.findIndex(l => l.transactionHash === log.transactionHash && (l.index ?? l.logIndex) === (log.index ?? log.logIndex))
                 );
 
                 transfers.push(...uniqueLogs);
+                lastScannedBlock = endBlock;
 
                 // Add delay to respect rate limits
                 await new Promise(resolve => setTimeout(resolve, 200));
 
             } catch (error) {
+                // Stop here so the next sync retries this range instead of skipping it for good.
                 console.warn(`⚠️ Failed to get logs for blocks ${block}-${endBlock}:`, error.message);
-                continue;
+                break;
             }
         }
 
-        return transfers;
+        return { transfers, lastScannedBlock };
     }
 
-    // ✅ IMPROVED: Better transaction filtering and processing
     async processTransfer(log, userAddress, chainKey) {
         const provider = this.providers[chainKey];
-        
+
         try {
             // Get transaction details
             const [tx, receipt] = await Promise.all([
@@ -329,20 +375,21 @@ class BlockchainService {
             // Determine transaction type
             const isOutgoing = fromAddress === userAddress.toLowerCase();
             const isIncoming = toAddress === userAddress.toLowerCase();
-            
+
             if (!isOutgoing && !isIncoming) return false;
 
             // Get token info
             const tokenInfo = await this.getTokenInfo(provider, log.address);
-            const tokenAmount = Number(amount) / Math.pow(10, tokenInfo.decimals);
-            
-            // ✅ SMART FILTERING: Skip obvious spam/dust
+            // formatUnits keeps precision for amounts above 2^53 before the conversion to Number
+            const tokenAmount = Number(ethers.formatUnits(amount, tokenInfo.decimals));
+
+            // Skip obvious spam/dust
             if (tokenAmount < 0.001) {
                 console.log(`🗑️ Skipping dust: ${tokenAmount} ${tokenInfo.symbol}`);
                 return false;
             }
-            
-            // ✅ SMART FILTERING: Skip small zero-value airdrops but allow large ones
+
+            // Skip small zero-value airdrops but allow large ones
             const ethValue = Number(tx.value || 0);
             if (ethValue === 0 && isIncoming && tokenAmount < 100) {
                 console.log(`🎁 Skipping small airdrop: ${tokenAmount} ${tokenInfo.symbol}`);
@@ -350,7 +397,13 @@ class BlockchainService {
             }
 
             // Check if transaction already exists
-            const existingTx = await Transaction.findOne({ hash: log.transactionHash });
+            const logIndex = Number(log.index ?? log.logIndex ?? 0);
+            const existingTx = await Transaction.findOne({
+                userAddress: userAddress.toLowerCase(),
+                chain: chainKey,
+                hash: log.transactionHash,
+                logIndex
+            });
             if (existingTx) return false;
 
             // Create transaction
@@ -358,6 +411,7 @@ class BlockchainService {
                 userAddress: userAddress.toLowerCase(),
                 chain: chainKey,
                 hash: log.transactionHash,
+                logIndex,
                 blockNumber: tx.blockNumber,
                 timestamp: new Date((await provider.getBlock(tx.blockNumber)).timestamp * 1000),
                 from: fromAddress,
@@ -367,15 +421,15 @@ class BlockchainService {
                 type: isOutgoing ? 'sell' : 'buy',
                 amount: tokenAmount,
                 priceUSD: await this.estimateTokenPrice(tokenAmount, tx.value, tokenInfo.decimals),
-                gasUsed: Number(receipt.gasUsed || 0), // ✅ FIX: Convert BigInt to Number
-                gasPrice: Number(tx.gasPrice || 0)     // ✅ FIX: Convert BigInt to Number
+                gasUsed: Number(receipt.gasUsed || 0),
+                gasPrice: Number(tx.gasPrice || 0)
             });
 
             transaction.valueUSD = transaction.amount * transaction.priceUSD;
-            
-            // ✅ FLEXIBLE SAVING: Save meaningful transactions
+
+            // Save meaningful transactions
             const shouldSave = transaction.valueUSD > 0.001 || ethValue > 0 || tokenAmount > 1000;
-            
+
             if (shouldSave) {
                 await transaction.save();
                 await this.updateTokenData(userAddress, chainKey, log.address, tokenInfo, transaction);
@@ -385,7 +439,7 @@ class BlockchainService {
                 console.log(`⏭️ Skipped: ${tokenAmount.toFixed(4)} ${tokenInfo.symbol} ($${transaction.valueUSD.toFixed(4)})`);
                 return false;
             }
-            
+
         } catch (error) {
             console.error(`❌ Process transfer error:`, error.message);
             return false;
@@ -394,51 +448,24 @@ class BlockchainService {
 
     async getTokenInfo(provider, tokenAddress) {
         try {
-            // Simple ERC20 calls with better error handling
             const [symbolResult, nameResult, decimalsResult] = await Promise.allSettled([
                 provider.call({ to: tokenAddress, data: '0x95d89b41' }), // symbol()
                 provider.call({ to: tokenAddress, data: '0x06fdde03' }), // name()
                 provider.call({ to: tokenAddress, data: '0x313ce567' })  // decimals()
             ]);
 
-            let symbol = 'UNKNOWN';
-            let name = 'Unknown Token';
+            const symbol = symbolResult.status === 'fulfilled'
+                ? decodeTokenString(symbolResult.value, 'UNKNOWN')
+                : 'UNKNOWN';
+            const name = nameResult.status === 'fulfilled'
+                ? decodeTokenString(nameResult.value, 'Unknown Token')
+                : 'Unknown Token';
+
+            // 0 is a valid number of decimals, so only fall back when the call gave nothing usable.
             let decimals = 18;
-
-            // Decode symbol
-            if (symbolResult.status === 'fulfilled' && symbolResult.value && symbolResult.value !== '0x') {
-                try {
-                    symbol = ethers.toUtf8String(symbolResult.value).replace(/\0/g, '').trim() || 'UNKNOWN';
-                } catch (e) {
-                    // Might be bytes32 format, try different approach
-                    try {
-                        symbol = ethers.parseBytes32String(symbolResult.value) || 'UNKNOWN';
-                    } catch (e2) {
-                        symbol = 'UNKNOWN';
-                    }
-                }
-            }
-
-            // Decode name
-            if (nameResult.status === 'fulfilled' && nameResult.value && nameResult.value !== '0x') {
-                try {
-                    name = ethers.toUtf8String(nameResult.value).replace(/\0/g, '').trim() || 'Unknown Token';
-                } catch (e) {
-                    try {
-                        name = ethers.parseBytes32String(nameResult.value) || 'Unknown Token';
-                    } catch (e2) {
-                        name = 'Unknown Token';
-                    }
-                }
-            }
-
-            // Decode decimals
             if (decimalsResult.status === 'fulfilled' && decimalsResult.value && decimalsResult.value !== '0x') {
-                try {
-                    decimals = parseInt(decimalsResult.value, 16) || 18;
-                } catch (e) {
-                    decimals = 18;
-                }
+                const parsed = Number(BigInt(decimalsResult.value));
+                if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 77) decimals = parsed;
             }
 
             return { symbol, name, decimals };
@@ -452,11 +479,13 @@ class BlockchainService {
     async estimateTokenPrice(tokenAmount, ethValue, decimals) {
         try {
             if (!tokenAmount || tokenAmount === 0 || !ethValue) return 0;
-            
+
             const ethAmount = Number(ethers.formatEther(ethValue.toString()));
             if (ethAmount === 0) return 0;
-            
-            // Simple price estimation - in production you'd use price oracles
+
+            // Native coin paid per token. There is no price oracle, so the fields named
+            // "USD" hold native-coin values (ETH, BNB or PLS), and only transactions
+            // that send native coin (buys) get a price.
             return Math.abs(ethAmount / tokenAmount);
         } catch (error) {
             return 0;
@@ -466,10 +495,10 @@ class BlockchainService {
     async updateTokenData(userAddress, chainKey, tokenAddress, tokenInfo, transaction) {
         try {
             const token = await Token.findOneAndUpdate(
-                { 
-                    userAddress: userAddress.toLowerCase(), 
-                    chain: chainKey, 
-                    contractAddress: tokenAddress.toLowerCase() 
+                {
+                    userAddress: userAddress.toLowerCase(),
+                    chain: chainKey,
+                    contractAddress: tokenAddress.toLowerCase()
                 },
                 {
                     $setOnInsert: {
@@ -532,7 +561,8 @@ class BlockchainService {
             }
 
             const currentBalance = totalBought - totalSold;
-            const unrealizedPnL = currentBalance > 0 ? (avgBuyPrice * currentBalance * 0.1) : 0; // Mock unrealized PnL
+            // Unrealized PnL needs a current market price, which this service does not have.
+            const unrealizedPnL = 0;
 
             await Token.updateOne(
                 { _id: tokenId },
@@ -558,11 +588,11 @@ class BlockchainService {
 
     async updateUserBalance(userAddress) {
         try {
-            const tokens = await Token.find({ 
+            const tokens = await Token.find({
                 userAddress: userAddress.toLowerCase(),
                 balance: { $gt: 0 } // Only count tokens with positive balance
             });
-            
+
             const totalBalance = tokens.reduce((sum, token) => sum + (token.valueUSD || 0), 0);
 
             await User.updateOne(
@@ -583,9 +613,9 @@ const blockchainService = new BlockchainService();
 
 // API Routes
 app.get('/api/health', (req, res) => {
-    res.json({ 
-        success: true, 
-        message: 'MemeJournal Pro API is running!',
+    res.json({
+        success: true,
+        message: 'Bloksi API is running',
         timestamp: new Date().toISOString(),
         chains: Object.keys(SUPPORTED_CHAINS)
     });
@@ -595,13 +625,13 @@ app.get('/api/health', (req, res) => {
 app.get('/api/users/:address', async (req, res) => {
     try {
         const { address } = req.params;
-        
+
         if (!ethers.isAddress(address)) {
             return res.status(400).json({ success: false, message: 'Invalid wallet address' });
         }
 
         const user = await User.findOne({ address: address.toLowerCase() });
-        
+
         if (!user) {
             return res.json({ success: true, data: { totalBalance: 0, isNewUser: true } });
         }
@@ -622,12 +652,12 @@ app.get('/api/tokens/:address/:chain', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Invalid wallet address' });
         }
 
-        if (!SUPPORTED_CHAINS[chain]) {
+        if (!Object.hasOwn(SUPPORTED_CHAINS, chain)) {
             return res.status(400).json({ success: false, message: 'Unsupported chain' });
         }
 
-        const tokens = await Token.find({ 
-            userAddress: address.toLowerCase(), 
+        const tokens = await Token.find({
+            userAddress: address.toLowerCase(),
             chain,
             balance: { $gt: 0 } // Only tokens with balance
         }).sort({ valueUSD: -1 });
@@ -644,7 +674,19 @@ app.get('/api/tokens/:address/:chain/:tokenId', async (req, res) => {
     try {
         const { address, chain, tokenId } = req.params;
 
-        const token = await Token.findOne({ 
+        if (!ethers.isAddress(address)) {
+            return res.status(400).json({ success: false, message: 'Invalid wallet address' });
+        }
+
+        if (!Object.hasOwn(SUPPORTED_CHAINS, chain)) {
+            return res.status(400).json({ success: false, message: 'Unsupported chain' });
+        }
+
+        if (!isObjectId(tokenId)) {
+            return res.status(400).json({ success: false, message: 'Invalid token id' });
+        }
+
+        const token = await Token.findOne({
             _id: tokenId,
             userAddress: address.toLowerCase(),
             chain
@@ -670,7 +712,7 @@ app.get('/api/liquidity/:address', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Invalid wallet address' });
         }
 
-        const positions = await LiquidityPosition.find({ 
+        const positions = await LiquidityPosition.find({
             userAddress: address.toLowerCase(),
             isActive: true
         }).sort({ valueUSD: -1 });
@@ -686,6 +728,14 @@ app.get('/api/liquidity/:address', async (req, res) => {
 app.get('/api/liquidity/:address/:positionId', async (req, res) => {
     try {
         const { address, positionId } = req.params;
+
+        if (!ethers.isAddress(address)) {
+            return res.status(400).json({ success: false, message: 'Invalid wallet address' });
+        }
+
+        if (!isObjectId(positionId)) {
+            return res.status(400).json({ success: false, message: 'Invalid position id' });
+        }
 
         const position = await LiquidityPosition.findOne({
             _id: positionId,
@@ -725,7 +775,7 @@ app.get('/api/analytics/:address', async (req, res) => {
             totalUnrealizedPnL: tokens.reduce((sum, t) => sum + (t.unrealizedPnL || 0), 0),
             totalTrades: transactions.length,
             activePositions: tokens.length + lpPositions.filter(lp => lp.isActive).length,
-            winRate: transactions.length > 0 ? 
+            winRate: transactions.length > 0 ?
                 (transactions.filter(t => (t.pnl || 0) > 0).length / transactions.length * 100) : 0
         };
 
@@ -737,19 +787,24 @@ app.get('/api/analytics/:address', async (req, res) => {
 });
 
 // Sync blockchain data
-app.post('/api/sync', async (req, res) => {
+app.post('/api/sync', syncLimiter, async (req, res) => {
     try {
-        const { address, chain, chains } = req.body;
+        const { address, chain, chains } = req.body || {};
 
-        if (!ethers.isAddress(address)) {
+        if (typeof address !== 'string' || !ethers.isAddress(address)) {
             return res.status(400).json({ success: false, message: 'Invalid wallet address' });
         }
 
-        const chainsToSync = chains || (chain ? [chain] : Object.keys(SUPPORTED_CHAINS));
+        if (chains !== undefined && !Array.isArray(chains)) {
+            return res.status(400).json({ success: false, message: 'chains must be an array of chain names' });
+        }
+
+        const requested = chains || (chain ? [chain] : Object.keys(SUPPORTED_CHAINS));
+        const chainsToSync = [...new Set(requested)];
 
         // Validate chains
         for (const chainKey of chainsToSync) {
-            if (!SUPPORTED_CHAINS[chainKey]) {
+            if (typeof chainKey !== 'string' || !Object.hasOwn(SUPPORTED_CHAINS, chainKey)) {
                 return res.status(400).json({ success: false, message: `Unsupported chain: ${chainKey}` });
             }
         }
@@ -759,48 +814,56 @@ app.post('/api/sync', async (req, res) => {
         const results = await blockchainService.syncUserData(address.toLowerCase(), chainsToSync);
         const totalBalance = await blockchainService.updateUserBalance(address.toLowerCase());
 
-        res.json({ 
-            success: true, 
-            data: { 
-                results, 
+        res.json({
+            success: true,
+            data: {
+                results,
                 totalBalance,
-                message: `Synced ${chainsToSync.length} chain(s) successfully` 
-            } 
+                message: `Synced ${chainsToSync.length} chain(s)`
+            }
         });
 
     } catch (error) {
         console.error('Sync error:', error);
-        res.status(500).json({ success: false, message: 'Sync failed: ' + error.message });
+        res.status(500).json({ success: false, message: 'Sync failed' });
     }
 });
 
-// Database Connection
-mongoose.connect(process.env.MONGODB_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-})
-.then(() => {
-    console.log('✅ Connected to MongoDB Atlas');
-    
-    // Start server
-    app.listen(PORT, () => {
-        console.log(`🚀 MemeJournal Pro Backend running on port ${PORT}`);
-        console.log(`📊 API Base URL: ${process.env.NODE_ENV === 'production' ? 'Production' : 'Development'} mode`);
-        console.log(`🔗 Supported chains: ${Object.keys(SUPPORTED_CHAINS).join(', ')}`);
-    });
-})
-.catch((error) => {
-    console.error('❌ MongoDB connection failed:', error);
-    process.exit(1);
-});
+// Start: connect to MongoDB, then listen. Skipped when the file is required by tests.
+function start() {
+    if (!process.env.MONGODB_URI) {
+        console.error('❌ MONGODB_URI is not set. Add it to your environment or a .env file.');
+        process.exit(1);
+    }
 
-// ✅ FIX: Graceful shutdown without callback
-process.on('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down gracefully');
-    mongoose.connection.close().then(() => {
-        console.log('MongoDB connection closed');
-        process.exit(0);
+    mongoose.connect(process.env.MONGODB_URI)
+        .then(() => {
+            console.log('✅ Connected to MongoDB');
+
+            app.listen(PORT, () => {
+                console.log(`🚀 Bloksi API running on port ${PORT}`);
+                console.log(`📊 Mode: ${process.env.NODE_ENV === 'production' ? 'production' : 'development'}`);
+                console.log(`🔗 Supported chains: ${Object.keys(SUPPORTED_CHAINS).join(', ')}`);
+            });
+        })
+        .catch((error) => {
+            console.error('❌ MongoDB connection failed:', error.message);
+            process.exit(1);
+        });
+
+    process.on('SIGTERM', () => {
+        console.log('SIGTERM received, shutting down gracefully');
+        mongoose.connection.close().then(() => {
+            console.log('MongoDB connection closed');
+            process.exit(0);
+        });
     });
-});
+}
+
+if (require.main === module) {
+    start();
+}
 
 module.exports = app;
+module.exports.decodeTokenString = decodeTokenString;
+module.exports.BlockchainService = BlockchainService;
